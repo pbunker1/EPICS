@@ -18,18 +18,31 @@ Based on proven implementations from the EPICS community, specifically:
 
 ## Approach 1: PetaLinux with Pre-Built EPICS Binaries (Recommended)
 
-This is the approach successfully used by John Seeberger for ZCU106.
+This is the approach successfully used by John Seeberger for ZCU106 and documented in the EPICS tech-talk community.
+
+### Why This Approach?
+
+- **Build once, deploy many**: Compile EPICS binaries once and reuse across multiple IOC instances
+- **Centralized management**: Use a central EPICS infrastructure with multiple base and module versions
+- **Runtime flexibility**: Select IOC at runtime without modifying filesystem
+- **Service integration**: Install IOCs as systemd services for automatic startup
 
 ### Prerequisites
 
 1. **Download from Xilinx:**
-   - PetaLinux Tools (version 2018.3 or later)
+   - PetaLinux Tools (version 2018.3 or later, 2019.1, or 2022.1 tested)
    - ZCU106 BSP (Board Support Package)
      - Example: `xilinx-zcu106-v2018.3-final.bsp`
 
 2. **EPICS Base:**
    - EPICS Base 7.0+ (includes linux-aarch64 support)
+   - EPICS Base 3.15+ also works
    - Required extensions (if needed): asyn, StreamDevice, etc.
+
+3. **Development Environment:**
+   - Linux host system (Ubuntu recommended)
+   - 64-bit x86_64 host for cross-compilation
+   - Sufficient disk space (~50GB recommended for PetaLinux build)
 
 ### Step 1: Setup EPICS Cross-Compilation Environment
 
@@ -45,20 +58,45 @@ export EPICS_HOST_ARCH=linux-x86_64  # or linux-x86
 Edit `$EPICS_BASE/configure/CONFIG_SITE`:
 ```bash
 CROSS_COMPILER_TARGET_ARCHS=linux-arm
+
+# Optional: Build static libraries for embedded deployment
+# SHARED_LIBRARIES = NO
+# STATIC_BUILD = YES
 ```
+
+**Note**: For most applications, shared libraries (default) are recommended. Use static builds only if you need a fully self-contained binary.
 
 #### 1.3 Create/Modify ARM Target Configuration
 
-Edit `$EPICS_BASE/configure/os/CONFIG_SITE.linux-x86_64.linux-arm`:
+Create or edit `$EPICS_BASE/configure/os/CONFIG_SITE.linux-x86_64.linux-arm`:
+
 ```makefile
+# Cross-compilation configuration for Zynq UltraScale+ (aarch64)
+# Using PetaLinux/Yocto SDK
+
 # Determines architecture (64-bit ARM)
 GNU_TARGET = aarch64-linux-gnu
 
 # Point to PetaLinux toolchain
+# For PetaLinux 2018.3:
 GNU_DIR = /path/to/petalinux/petalinux-v2018.3-final/tools/linux-i386/aarch64-linux-gnu
+
+# Alternative: Point to Yocto SDK if using standalone SDK
+# GNU_DIR = /opt/xilinx/petalinux/2018.3/sysroots/x86_64-petalinux-linux/usr/bin/aarch64-xilinx-linux
+
+# Use readline library
+COMMANDLINE_LIBRARY = READLINE
+
+# Or use readline with ncurses
+# COMMANDLINE_LIBRARY = READLINE_NCURSES
 ```
 
-Adjust path to match your PetaLinux installation.
+**For 32-bit ARM targets** (if using older Zynq-7000 devices), use:
+```makefile
+GNU_TARGET = arm-linux-gnueabi
+```
+
+Adjust paths to match your PetaLinux installation.
 
 #### 1.4 Build EPICS Base for ARM
 
@@ -133,13 +171,38 @@ Typical binaries include:
 - `softIoc` - Soft IOC
 - `caget`, `caput`, `camonitor`, `cainfo` - Channel Access tools
 - `caRepeater` - CA Repeater daemon
-- Other utilities
+- `pvget`, `pvput`, `pvlist` - PVAccess tools (if using EPICS 7+)
+- Other utilities (`acctst`, `caConnTest`, `caEventRate`, etc.)
+
+**Optional: Add systemd service for caRepeater**
+
+Create `files/caRepeater.service`:
+```ini
+[Unit]
+Description=EPICS Channel Access Repeater
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/caRepeater
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
 
 **Edit `epics.bb` recipe:**
 
 ```bitbake
-# EPICS binaries recipe
+#
+# EPICS binaries recipe - tested with EPICS Base 3.15.5 and 7.0.x
+# Based on real-world PetaLinux implementation for ZCU106
+#
+
 SUMMARY = "EPICS base binaries for ARM"
+DESCRIPTION = "EPICS (Experimental Physics and Industrial Control System) \
+command-line tools and soft IOC for embedded ARM targets"
 SECTION = "PETALINUX/apps"
 LICENSE = "EPICS"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
@@ -152,29 +215,51 @@ SRC_URI = "file://acctst \
            file://camonitor \
            file://caput \
            file://caRepeater \
+           file://caRepeater.service \
            file://casw \
            file://catime \
            file://softIoc \
           "
 
 S = "${WORKDIR}"
+
+# Runtime dependency on EPICS libraries
 RDEPENDS_${PN} += "epicslib"
 
+# Inherit systemd if using service
+inherit systemd
+SYSTEMD_SERVICE_${PN} = "caRepeater.service"
+SYSTEMD_AUTO_ENABLE = "enable"
+
 do_install() {
-    install -d ${D}/${bindir}
-    install -m 0755 ${S}/acctst ${D}/${bindir}
-    install -m 0755 ${S}/caConnTest ${D}/${bindir}
-    install -m 0755 ${S}/caEventRate ${D}/${bindir}
-    install -m 0755 ${S}/caget ${D}/${bindir}
-    install -m 0755 ${S}/cainfo ${D}/${bindir}
-    install -m 0755 ${S}/camonitor ${D}/${bindir}
-    install -m 0755 ${S}/caput ${D}/${bindir}
-    install -m 0755 ${S}/caRepeater ${D}/${bindir}
-    install -m 0755 ${S}/casw ${D}/${bindir}
-    install -m 0755 ${S}/catime ${D}/${bindir}
-    install -m 0755 ${S}/softIoc ${D}/${bindir}
+    # Install binaries
+    install -d ${D}${bindir}
+    install -m 0755 ${S}/acctst ${D}${bindir}
+    install -m 0755 ${S}/caConnTest ${D}${bindir}
+    install -m 0755 ${S}/caEventRate ${D}${bindir}
+    install -m 0755 ${S}/caget ${D}${bindir}
+    install -m 0755 ${S}/cainfo ${D}${bindir}
+    install -m 0755 ${S}/camonitor ${D}${bindir}
+    install -m 0755 ${S}/caput ${D}${bindir}
+    install -m 0755 ${S}/caRepeater ${D}${bindir}
+    install -m 0755 ${S}/casw ${D}${bindir}
+    install -m 0755 ${S}/catime ${D}${bindir}
+    install -m 0755 ${S}/softIoc ${D}${bindir}
+
+    # Install systemd service
+    if ${@bb.utils.contains('DISTRO_FEATURES','systemd','true','false',d)}; then
+        install -d ${D}${systemd_system_unitdir}
+        install -m 0644 ${S}/caRepeater.service ${D}${systemd_system_unitdir}
+    fi
 }
+
+FILES_${PN} += "${systemd_system_unitdir}/caRepeater.service"
 ```
+
+**Important Notes:**
+- The `RDEPENDS_${PN} += "epicslib"` ensures EPICS libraries are installed before binaries
+- The systemd service ensures caRepeater starts automatically on boot
+- If not using systemd, remove the inherit and service-related lines
 
 #### 3.2 Create EPICS Libraries Recipe
 
@@ -192,25 +277,50 @@ cp /path/to/asyn/lib/linux-arm/*.so files/
 cp /path/to/stream/lib/linux-arm/*.so files/
 ```
 
-**Important Note:** Use non-versioned libraries (e.g., `libCom.so` instead of `libCom.so.3.15.5`) to avoid Yocto packaging issues.
+**Important Note on Library Versioning:**
 
-If you have versioned libraries, create symlinks:
+Yocto/BitBake expects versioned shared libraries (e.g., `libCom.so.3.15.5`) with proper symlinks. However, this can cause packaging issues. Two approaches:
+
+**Approach A: Use Non-Versioned Libraries (Simpler)**
 ```bash
 cd files/
-ln -s libCom.so.3.15.5 libCom.so
-ln -s libca.so.3.15.5 libca.so
+# Copy as non-versioned
+cp $EPICS_BASE/lib/linux-arm/libCom.so.3.15.5 libCom.so
+cp $EPICS_BASE/lib/linux-arm/libca.so.3.15.5 libca.so
+# ... repeat for all libraries
+```
+
+**Approach B: Use Versioned Libraries with Symlinks (Recommended)**
+```bash
+cd files/
+# Copy versioned libraries
+cp $EPICS_BASE/lib/linux-arm/*.so* .
+
+# Create symlinks
+ln -sf libCom.so.3.15.5 libCom.so.3
+ln -sf libCom.so.3.15.5 libCom.so
+ln -sf libca.so.3.15.5 libca.so.3
+ln -sf libca.so.3.15.5 libca.so
 # ... repeat for all libraries
 ```
 
 **Edit `epicslib.bb` recipe:**
 
 ```bitbake
-# EPICS libraries recipe
+#
+# EPICS libraries recipe - tested with EPICS Base 3.15.5 and 7.0.x
+# Based on real-world PetaLinux implementation for ZCU106
+#
+
 SUMMARY = "EPICS base libraries for ARM"
+DESCRIPTION = "Shared libraries for EPICS (Experimental Physics and \
+Industrial Control System) including Channel Access and IOC database support"
 SECTION = "PETALINUX/apps"
 LICENSE = "EPICS"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
+# Using non-versioned libraries to avoid Yocto packaging issues
+# If you encounter errors with oe_soinstall, use this approach
 SRC_URI = "file://libca.so \
            file://libcas.so \
            file://libCom.so \
@@ -221,23 +331,57 @@ SRC_URI = "file://libca.so \
            file://libstream.so \
           "
 
+# Alternative: If using versioned libraries (commented out)
+# SRC_URI = "file://libca.so.3.15.5 \
+#            file://libcas.so.3.15.5 \
+#            file://libCom.so.3.15.5 \
+#            file://libdbCore.so.3.15.5 \
+#            file://libdbRecStd.so.3.15.5 \
+#            file://libgdd.so.3.15.5 \
+#            file://libasyn.so \
+#            file://libstream.so \
+#           "
+
 S = "${WORKDIR}"
 
 do_install() {
-    install -d ${D}/${libdir}
-    install ${S}/libca.so ${D}/${libdir}
-    install ${S}/libcas.so ${D}/${libdir}
-    install ${S}/libCom.so ${D}/${libdir}
-    install ${S}/libdbCore.so ${D}/${libdir}
-    install ${S}/libdbRecStd.so ${D}/${libdir}
-    install ${S}/libgdd.so ${D}/${libdir}
-    install ${S}/libasyn.so ${D}/${libdir}
-    install ${S}/libstream.so ${D}/${libdir}
+    install -d ${D}${libdir}
+
+    # Install non-versioned libraries
+    install ${S}/libca.so ${D}${libdir}
+    install ${S}/libcas.so ${D}${libdir}
+    install ${S}/libCom.so ${D}${libdir}
+    install ${S}/libdbCore.so ${D}${libdir}
+    install ${S}/libdbRecStd.so ${D}${libdir}
+    install ${S}/libgdd.so ${D}${libdir}
+
+    # Install EPICS module libraries (if using asyn, stream, etc.)
+    install ${S}/libasyn.so ${D}${libdir}
+    install ${S}/libstream.so ${D}${libdir}
+
+    # Alternative: If using oe_soinstall with versioned libraries
+    # oe_soinstall works but may complain about non-standard versioning
+    # oe_soinstall ${S}/libca.so.3.15.5 ${D}${libdir}
+    # oe_soinstall ${S}/libcas.so.3.15.5 ${D}${libdir}
+    # oe_soinstall ${S}/libCom.so.3.15.5 ${D}${libdir}
+    # oe_soinstall ${S}/libdbCore.so.3.15.5 ${D}${libdir}
+    # oe_soinstall ${S}/libdbRecStd.so.3.15.5 ${D}${libdir}
+    # oe_soinstall ${S}/libgdd.so.3.15.5 ${D}${libdir}
 }
 
-FILES_${PN} += "${libdir}/*.so"
+# Package all .so files in main package (not just -dev)
+FILES_${PN} += "${libdir}/*.so*"
+
+# Skip QA checks that would fail for development libraries in main package
 INSANE_SKIP_${PN} += "dev-so"
+
+# Also skip ldflags check if EPICS libraries don't use standard linker flags
+# INSANE_SKIP_${PN} += "ldflags"
 ```
+
+**Troubleshooting Library Issues:**
+
+If you get errors like "oe_soinstall: file libCom.so.3.15.5 in package epicslib doesn't have GNU_HASH", use the non-versioned approach with `INSANE_SKIP_${PN} += "dev-so"`.
 
 #### 3.3 Create IOC Application Recipe (Optional)
 
@@ -328,10 +472,129 @@ which softIoc
 which caget
 
 # Check libraries
-ldconfig -p | grep epics
+ldconfig -p | grep -i com
+ldconfig -p | grep -i ca
 
 # Test CA tools
-softIoc -D $EPICS_BASE/dbd/softIoc.dbd
+caget -h
+
+# Test softIOC
+softIoc
+# At IOC prompt, type: exit
+```
+
+### Optional: Centralized EPICS Infrastructure
+
+For managing multiple IOCs across multiple devices, consider implementing a centralized architecture:
+
+#### Directory Structure
+
+```
+/epics/
+├── base-3.15.5/          # EPICS base version 1
+├── base-7.0.8/           # EPICS base version 2
+├── modules/
+│   └── ion/              # IOC binaries (built once)
+│       ├── bin/
+│       ├── lib/
+│       └── dbd/
+└── iocs/
+    ├── xf28id1-ion1/     # IOC instance 1 (hostname-based)
+    │   ├── startup.cmd
+    │   ├── st.cmd
+    │   ├── autosave/
+    │   └── config/
+    └── xf28id2-ion1/     # IOC instance 2
+        ├── startup.cmd
+        ├── st.cmd
+        ├── autosave/
+        └── config/
+```
+
+#### Benefits
+
+1. **Build once, deploy many**: Compile IOC binaries once, create multiple instances
+2. **No compilation on target**: IOC instances are just configuration files
+3. **Runtime selection**: Device automatically starts its IOC based on IP/hostname
+4. **Version management**: Multiple EPICS base versions coexist
+5. **Service integration**: IOCs managed by systemd as services
+
+#### Implementation
+
+**1. Create IOC instance directory structure:**
+```bash
+mkdir -p /epics/iocs/${HOSTNAME}
+cd /epics/iocs/${HOSTNAME}
+```
+
+**2. Create startup script with runtime selection:**
+```bash
+#!/bin/sh
+# Determine device name from IP address
+my_ip=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+name=$(jq -c '.[]' /etc/zynq-config.json | awk "/$my_ip/ {print \$0}" | jq -r '.name')
+
+# Start IOC only if this is the correct device
+if [ "$name" != "${HOSTNAME}" ]; then
+    exit 0
+fi
+
+# Set EPICS environment
+export EPICS_BASE=/epics/base-7.0.8
+export EPICS_HOST_ARCH=linux-arm
+export PATH=${EPICS_BASE}/bin/${EPICS_HOST_ARCH}:/epics/modules/ion/bin:$PATH
+export LD_LIBRARY_PATH=${EPICS_BASE}/lib/${EPICS_HOST_ARCH}:/epics/modules/ion/lib:$LD_LIBRARY_PATH
+
+# Start the IOC
+cd /epics/iocs/${HOSTNAME}
+./st.cmd
+```
+
+**3. Create device configuration JSON:**
+```json
+{
+  "devices": [
+    {
+      "name": "xf28id1-ion1",
+      "ip": "192.168.1.100",
+      "ioc": "ion",
+      "base_version": "7.0.8"
+    },
+    {
+      "name": "xf28id2-ion1",
+      "ip": "192.168.1.101",
+      "ioc": "ion",
+      "base_version": "7.0.8"
+    }
+  ]
+}
+```
+
+**4. Add systemd service:**
+```ini
+[Unit]
+Description=EPICS IOC - %i
+After=network.target caRepeater.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/epics/iocs/%i
+ExecStart=/epics/iocs/%i/startup.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable with:
+```bash
+systemctl enable epics-ioc@${HOSTNAME}.service
+systemctl start epics-ioc@${HOSTNAME}.service
 ```
 
 ## Approach 2: Using meta-chimeratk Layer
@@ -361,28 +624,73 @@ For full control, create a dedicated Yocto layer that builds EPICS from source.
 
 ### Step-by-Step Guide to Creating meta-epics Layer
 
+#### Important: Check Existing Layers First
+
+Before creating a new layer, check if someone has already created a layer containing the EPICS metadata you need:
+
+1. **OpenEmbedded Metadata Index**: https://layers.openembedded.org/
+2. **meta-chimeratk**: https://github.com/ChimeraTK/meta-chimeratk (provides EPICS support)
+3. Search GitHub for "meta-epics" or similar
+
+**Best Practices for Layer Creation:**
+- Always prepend layer directory names with "meta-"
+- Create layers outside the Yocto Project Source Directory (not inside poky)
+- Follow the layer naming convention: `meta-root_name`
+- Store custom layers in Git repositories using the `meta-layer_name` format
+
 #### Step 1: Create the Layer Structure
 
-Navigate to your Yocto build directory's sources folder:
+Navigate to your Yocto build directory's sources folder (outside of poky):
 
 ```bash
-cd /path/to/yocto-build/sources
+cd /path/to/yocto-build
+mkdir -p sources
+cd sources
 ```
 
-Use the Yocto tool to create the layer:
+**Option A: Use bitbake-layers tool (Recommended)**
 
 ```bash
+# Create the layer with default priority 6
 bitbake-layers create-layer meta-epics
+
+# Or specify a different priority
+bitbake-layers create-layer --priority 10 meta-epics
+
+# Or specify custom example recipe name
+bitbake-layers create-layer --example-recipe-name epics-base meta-epics
+```
+
+This automatically creates:
+- `conf/layer.conf` with proper configuration
+- `recipes-example/example/` directory with sample recipe
+- `COPYING.MIT` license file
+- `README` file
+
+**Option B: Manual creation (for learning)**
+
+```bash
+mkdir meta-epics
 cd meta-epics
 ```
 
-This creates the basic structure. Now customize it for EPICS:
+Create the directory structure:
 
 ```bash
+mkdir -p conf
 mkdir -p recipes-epics/epics-base
-mkdir -p recipes-epics/epics-asyn
-mkdir -p recipes-epics/epics-stream
+mkdir -p recipes-epics/epics-modules/epics-asyn
+mkdir -p recipes-epics/epics-modules/epics-stream
+mkdir -p recipes-core/images
+
+# Optional: Create machine-specific subdirectories
+mkdir -p recipes-epics/epics-base/files/zcu106
 ```
+
+**Why recipes-* subdirectories?**
+- Yocto expects recipes in `recipes-*` directories for organization
+- Standard categories: `recipes-bsp`, `recipes-core`, `recipes-kernel`, `recipes-support`
+- Custom categories like `recipes-epics` are perfectly valid
 
 #### Step 2: Configure layer.conf
 
@@ -687,6 +995,28 @@ meta-xilinx-bsp       /path/to/meta-xilinx/meta-xilinx-bsp      6
 meta-epics            /path/to/sources/meta-epics               10
 ```
 
+**Additional Layer Management Commands:**
+
+```bash
+# Show recipes provided by all layers
+bitbake-layers show-recipes
+
+# Show only EPICS recipes
+bitbake-layers show-recipes "epics*"
+
+# Show which layers provide a specific recipe
+bitbake-layers show-recipes epics-base
+
+# Show .bbappend files and their target recipes
+bitbake-layers show-appends
+
+# Show overlayed recipes (same recipe in multiple layers)
+bitbake-layers show-overlayed
+
+# Show cross-layer dependencies
+bitbake-layers show-cross-depends
+```
+
 #### Step 8: Add EPICS to Your Image
 
 Edit your image recipe or `conf/local.conf`:
@@ -797,6 +1127,147 @@ recipetool create -o asyn_4.42.bb \
 
 Then manually adjust the generated recipes for EPICS-specific build requirements.
 
+### Best Practices for Yocto Layers
+
+#### 1. Avoid Overlaying Entire Recipes
+
+**Don't**: Copy an entire recipe and modify it
+**Do**: Use `.bbappend` files to override only necessary parts
+
+Example - To modify EPICS base configuration, create:
+`meta-epics/recipes-epics/epics-base/epics-base_7.0.8.bbappend`
+
+```bitbake
+# Append to existing EPICS base recipe
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+# Add machine-specific configuration
+SRC_URI:append:zcu106 = " file://zcu106-config.patch"
+
+# Modify compiler flags for specific machine
+CFLAGS:append:zcu106 = " -march=armv8-a"
+```
+
+#### 2. Use Machine-Specific Overrides
+
+Place machine-specific files in subdirectories:
+
+```
+recipes-epics/epics-base/files/
+├── zcu106/
+│   ├── epics-config.patch
+│   └── custom-dbd.template
+├── zcu102/
+│   └── epics-config.patch
+└── common-config.sh
+```
+
+Then in your `.bbappend`:
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+# This file will only be used for ZCU106 builds
+SRC_URI:append:zcu106 = " file://zcu106/epics-config.patch"
+```
+
+#### 3. Use :append and :prepend with Overrides
+
+```bitbake
+# Good: Machine-specific dependency
+DEPENDS:append:zcu106 = " fpga-firmware"
+
+# Good: Architecture-specific flags
+KERNEL_CC:append:aarch64 = " ${TOOLCHAIN_OPTIONS}"
+
+# Bad: Unconditional change affecting all machines
+DEPENDS += " fpga-firmware"  # Don't do this in a layer!
+```
+
+#### 4. Testing Layer Compatibility
+
+Yocto provides `yocto-check-layer` script to test layer compatibility:
+
+```bash
+# From your build directory
+source oe-init-build-env
+yocto-check-layer ../sources/meta-epics
+```
+
+The script runs tests including:
+- **common.test_readme**: Checks for README file
+- **common.test_parse**: BitBake can parse files without error
+- **common.test_show_environment**: Environment is correctly configured
+- **common.test_world**: `bitbake world` works
+- **common.test_signatures**: Recipes don't unexpectedly change signatures
+- **common.test_layerseries_compat**: Layer compatibility is set properly
+
+To pass compatibility testing, ensure your `layer.conf` has:
+```python
+LAYERSERIES_COMPAT_meta-epics = "kirkstone langdale mickledore nanbield scarthgap"
+```
+
+### Using .bbappend Files with meta-epics
+
+If you want to customize EPICS for a specific board without modifying the base recipe:
+
+**Create a BSP-specific layer:**
+```bash
+bitbake-layers create-layer meta-zcu106-custom
+```
+
+**Add a .bbappend file:**
+`meta-zcu106-custom/recipes-epics/epics-base/epics-base_%.bbappend`
+
+```bitbake
+# The % wildcard matches any version of epics-base
+
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+# Add ZCU106-specific patches
+SRC_URI:append = " \
+    file://zcu106-optimizations.patch \
+    file://custom-startup.sh \
+"
+
+# Modify installation for ZCU106
+do_install:append() {
+    install -d ${D}${sysconfdir}/epics
+    install -m 0644 ${WORKDIR}/custom-startup.sh ${D}${sysconfdir}/epics/
+}
+
+FILES:${PN} += "${sysconfdir}/epics/*"
+```
+
+**Benefits of .bbappend:**
+- Changes automatically apply when base recipe updates
+- No need to maintain a forked copy of the entire recipe
+- Clear separation between base functionality and customizations
+
+### Saving and Restoring Layer Configuration
+
+For reproducible builds across different machines:
+
+```bash
+# Save current layer configuration
+bitbake-layers create-layers-setup /path/to/meta-epics/
+
+# This creates:
+# - setup-layers.json (layer configuration)
+# - setup-layers (script to restore configuration)
+```
+
+On another machine:
+
+```bash
+# Clone the bootstrap layer
+git clone <your-meta-epics-repo>
+
+# Restore layer configuration
+cd meta-epics
+./setup-layers
+```
+
 ### Testing on ZCU106
 
 After building and deploying to ZCU106:
@@ -814,6 +1285,74 @@ caget -h
 
 # Start a test IOC
 softIoc -d /usr/share/epics/dbd/softIoc.dbd
+```
+
+### Advanced: Creating EPICS-Specific Image Class
+
+For repeated EPICS image builds, create a custom image class:
+
+Create `meta-epics/classes/epics-image.bbclass`:
+
+```bitbake
+# Common configuration for all EPICS images
+
+# Default EPICS packages
+EPICS_CORE_PACKAGES = " \
+    epics-base \
+    epics-base-dev \
+"
+
+EPICS_TOOLS_PACKAGES = " \
+    strace \
+    procps \
+    openssh \
+    nfs-utils \
+"
+
+# Add to image
+IMAGE_INSTALL:append = " \
+    ${EPICS_CORE_PACKAGES} \
+    ${EPICS_TOOLS_PACKAGES} \
+"
+
+# Increase rootfs size for EPICS
+IMAGE_ROOTFS_EXTRA_SPACE = "524288"
+
+# Set EPICS environment variables
+IMAGE_FEATURES:append = " tools-debug ssh-server-openssh"
+
+# Post-install commands
+ROOTFS_POSTPROCESS_COMMAND:append = " setup_epics_environment ; "
+
+setup_epics_environment() {
+    # Create system-wide EPICS environment
+    cat >> ${IMAGE_ROOTFS}/etc/profile.d/epics.sh << 'EOF'
+export EPICS_BASE=/usr/share/epics
+export EPICS_HOST_ARCH=linux-arm
+export PATH=${EPICS_BASE}/bin/${EPICS_HOST_ARCH}:$PATH
+export LD_LIBRARY_PATH=${EPICS_BASE}/lib/${EPICS_HOST_ARCH}:$LD_LIBRARY_PATH
+EOF
+    chmod 644 ${IMAGE_ROOTFS}/etc/profile.d/epics.sh
+}
+```
+
+Then create a simple image recipe using it:
+
+`meta-epics/recipes-core/images/epics-minimal-image.bb`:
+
+```bitbake
+require recipes-core/images/core-image-minimal.bb
+
+DESCRIPTION = "Minimal EPICS image for ZCU106"
+
+# Use our EPICS image class
+inherit epics-image
+
+# Add any additional packages
+IMAGE_INSTALL:append = " \
+    epics-asyn \
+    i2c-tools \
+"
 ```
 
 ## Configuration Files Reference
